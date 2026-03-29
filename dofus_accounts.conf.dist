@@ -1,0 +1,10 @@
+# Format : pseudo:initiative
+# Sections supportees : [ACTIVE] et [HISTORICAL]
+
+[ACTIVE]
+Nayl:100
+Compte2:90
+
+[HISTORICAL]
+Compte3:80
+Compte4:70
