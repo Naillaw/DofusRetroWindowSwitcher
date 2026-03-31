@@ -9,9 +9,13 @@ DEFAULT_CONFIG_FILE="${SCRIPT_DIR}/dofus_accounts.conf.dist"
 WINDOW_PATTERN="Dofus Retro"
 DEFAULT_INITIATIVE=100
 DEBUG="${DEBUG:-0}"
+NOTIFICATION_APP_PATTERN="${NOTIFICATION_APP_PATTERN:-}"
+NOTIFICATION_DEDUP_SECONDS="${NOTIFICATION_DEDUP_SECONDS:-3}"
 
 ACTIVE_ACCOUNTS=()
 HISTORICAL_ACCOUNTS=()
+LAST_NOTIFICATION_SIGNATURE=""
+LAST_NOTIFICATION_TS=0
 
 debug_log() {
     if [[ "${DEBUG}" == "1" ]]; then
@@ -31,6 +35,7 @@ Usage:
   $0 --scan-config
   $0 --set-ini "<pseudo>" <initiative>
   $0 --edit-active
+  $0 --listen-notifications
 EOF
 }
 
@@ -66,6 +71,15 @@ require_commands() {
 trim_leading_spaces() {
     local value="$1"
     echo "${value#"${value%%[![:space:]]*}"}"
+}
+
+normalize_notification_text() {
+    local value="$1"
+
+    value="$(printf '%s\n' "${value}" | sed -E "s/<[^>]*>/ /g; s/&nbsp;/ /g; s/&quot;/\"/g; s/&apos;/'/g; s/&#39;/'/g; s/&amp;/\\&/g; s/&lt;/</g; s/&gt;/>/g")"
+    value="$(printf '%s\n' "${value}" | tr '\r\n\t' '   ' | awk '{$1=$1; print}')"
+
+    printf '%s\n' "${value}"
 }
 
 parse_config_file() {
@@ -174,9 +188,19 @@ validate_initiative() {
     [[ "$1" =~ ^[0-9]+$ ]] || die "Initiative invalide : $1"
 }
 
+validate_notification_settings() {
+    [[ "${NOTIFICATION_DEDUP_SECONDS}" =~ ^[0-9]+$ ]] || die "NOTIFICATION_DEDUP_SECONDS invalide : ${NOTIFICATION_DEDUP_SECONDS}"
+}
+
 extract_window_title() {
     local line="$1"
     echo "${line}" | awk '{for (i = 4; i <= NF; i++) printf "%s%s", $i, (i < NF ? OFS : ORS)}'
+}
+
+is_game_window_title() {
+    local title="$1"
+
+    [[ "${title}" == *" - ${WINDOW_PATTERN}"* ]]
 }
 
 extract_pseudo_from_window() {
@@ -184,11 +208,392 @@ extract_pseudo_from_window() {
     local title
 
     title="$(extract_window_title "${line}")"
+
+    if ! is_game_window_title "${title}"; then
+        echo ""
+        return 0
+    fi
+
     echo "${title%% - ${WINDOW_PATTERN}*}"
 }
 
 load_dofus_windows() {
     mapfile -t WINDOWS < <(wmctrl -l | grep "${WINDOW_PATTERN}" || true)
+}
+
+normalize_window_id() {
+    local window_id="$1"
+
+    [[ "${window_id}" =~ ^0x[0-9a-fA-F]+$ ]] || return 1
+    printf '0x%x\n' "$((window_id))"
+}
+
+get_active_window_id() {
+    local active_window_id=""
+
+    active_window_id="$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '/_NET_ACTIVE_WINDOW/ {print $NF}')"
+    [[ -n "${active_window_id}" ]] || return 1
+    [[ "${active_window_id}" != "0x0" ]] || return 1
+
+    normalize_window_id "${active_window_id}"
+}
+
+focus_window() {
+    local target_window_id="$1"
+
+    wmctrl -ia "${target_window_id}"
+}
+
+build_open_window_title_map() {
+    local title_map_name="$1"
+    local line=""
+    local title=""
+    local window_id=""
+    local -n title_map_ref="${title_map_name}"
+
+    title_map_ref=()
+    load_dofus_windows
+
+    for line in "${WINDOWS[@]}"; do
+        title="$(extract_window_title "${line}")"
+        window_id="${line%% *}"
+
+        if ! is_game_window_title "${title}"; then
+            continue
+        fi
+
+        if [[ -n "${title}" && -z "${title_map_ref["${title}"]:-}" ]]; then
+            title_map_ref["${title}"]="${window_id}"
+        fi
+    done
+
+    [[ ${#title_map_ref[@]} -gt 0 ]]
+}
+
+extract_dbus_string() {
+    local line="$1"
+
+    if [[ "${line}" =~ ^[[:space:]]*string\ \"(.*)\"$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    return 1
+}
+
+is_notify_call_header() {
+    local line="$1"
+
+    if [[ "${line}" == method\ call*member=Notify*interface=org.freedesktop.Notifications* ]] \
+        || [[ "${line}" == method\ call*interface=org.freedesktop.Notifications*member=Notify* ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+is_dbus_message_header() {
+    local line="$1"
+
+    [[ "${line}" == method\ call* ]] \
+        || [[ "${line}" == method\ return* ]] \
+        || [[ "${line}" == signal* ]] \
+        || [[ "${line}" == error* ]]
+}
+
+process_dbus_notification_stream() {
+    local callback_name="$1"
+    local line=""
+    local trimmed=""
+    local in_block=0
+    local parse_state=0
+    local app_name=""
+    local app_icon=""
+    local summary=""
+    local body=""
+    local string_value=""
+    local is_message_header=0
+    local pending_field=""
+    local pending_string_value=""
+
+    finalize_current_block() {
+        [[ "${in_block}" == "1" ]] || return 0
+
+        if [[ -n "${app_name}${summary}${body}" ]]; then
+            "${callback_name}" "${app_name}" "${summary}" "${body}"
+        fi
+
+        in_block=0
+        parse_state=0
+        app_name=""
+        app_icon=""
+        summary=""
+        body=""
+        pending_field=""
+        pending_string_value=""
+    }
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        is_message_header=0
+        if is_dbus_message_header "${line}"; then
+            is_message_header=1
+        fi
+
+        if [[ "${in_block}" == "1" && "${is_message_header}" == "1" ]]; then
+            finalize_current_block
+        fi
+
+        if is_notify_call_header "${line}"; then
+            in_block=1
+            parse_state=0
+            app_name=""
+            app_icon=""
+            summary=""
+            body=""
+            pending_field=""
+            pending_string_value=""
+            continue
+        fi
+
+        if [[ "${is_message_header}" == "1" ]]; then
+            continue
+        fi
+
+        [[ "${in_block}" == "1" ]] || continue
+
+        if [[ -n "${pending_field}" ]]; then
+            if [[ "${line}" == *\" ]]; then
+                pending_string_value+=$'\n'"${line%\"}"
+
+                case "${pending_field}" in
+                    app_name)
+                        app_name="${pending_string_value}"
+                        parse_state=1
+                        ;;
+                    app_icon)
+                        app_icon="${pending_string_value}"
+                        parse_state=3
+                        ;;
+                    summary)
+                        summary="${pending_string_value}"
+                        ;;
+                    body)
+                        body="${pending_string_value}"
+                        ;;
+                esac
+
+                if [[ "${pending_field}" == "summary" ]]; then
+                    parse_state=4
+                elif [[ "${pending_field}" == "body" ]]; then
+                    parse_state=5
+                fi
+
+                pending_field=""
+                pending_string_value=""
+            else
+                pending_string_value+=$'\n'"${line}"
+            fi
+            continue
+        fi
+
+        if [[ -z "${line}" ]]; then
+            finalize_current_block
+            continue
+        fi
+
+        trimmed="$(trim_leading_spaces "${line}")"
+
+        case "${parse_state}" in
+            0)
+                if string_value="$(extract_dbus_string "${line}")"; then
+                    app_name="${string_value}"
+                    parse_state=1
+                elif [[ "${line}" =~ ^[[:space:]]*string\ \"(.*)$ ]]; then
+                    pending_field="app_name"
+                    pending_string_value="${BASH_REMATCH[1]}"
+                fi
+                ;;
+            1)
+                if [[ "${trimmed}" == uint32\ * ]]; then
+                    parse_state=2
+                fi
+                ;;
+            2)
+                if string_value="$(extract_dbus_string "${line}")"; then
+                    app_icon="${string_value}"
+                    parse_state=3
+                elif [[ "${line}" =~ ^[[:space:]]*string\ \"(.*)$ ]]; then
+                    pending_field="app_icon"
+                    pending_string_value="${BASH_REMATCH[1]}"
+                fi
+                ;;
+            3)
+                if string_value="$(extract_dbus_string "${line}")"; then
+                    summary="${string_value}"
+                    parse_state=4
+                elif [[ "${line}" =~ ^[[:space:]]*string\ \"(.*)$ ]]; then
+                    pending_field="summary"
+                    pending_string_value="${BASH_REMATCH[1]}"
+                fi
+                ;;
+            4)
+                if string_value="$(extract_dbus_string "${line}")"; then
+                    body="${string_value}"
+                    parse_state=5
+                elif [[ "${line}" =~ ^[[:space:]]*string\ \"(.*)$ ]]; then
+                    pending_field="body"
+                    pending_string_value="${BASH_REMATCH[1]}"
+                fi
+                ;;
+        esac
+
+        if (( parse_state >= 5 )) && [[ "${trimmed}" == int32\ * ]]; then
+            finalize_current_block
+        fi
+    done
+
+    if [[ "${in_block}" == "1" ]]; then
+        finalize_current_block
+    fi
+}
+
+notification_matches_filter() {
+    local app_name="$1"
+    local summary="$2"
+    local body="$3"
+    local pattern_lower="${NOTIFICATION_APP_PATTERN,,}"
+    local haystack_lower=""
+
+    [[ -z "${pattern_lower}" ]] && return 0
+
+    haystack_lower="${app_name,,} ${summary,,} ${body,,}"
+    [[ "${haystack_lower}" == *"${pattern_lower}"* ]]
+}
+
+find_matching_window_title_from_summary() {
+    local summary="$1"
+    local map_name="$2"
+    local summary_normalized=""
+    local summary_lower=""
+    local title=""
+    local title_normalized=""
+    local title_lower=""
+    local -n map_ref="${map_name}"
+
+    summary_normalized="$(normalize_notification_text "${summary}")"
+    summary_lower="${summary_normalized,,}"
+
+    [[ -n "${summary_lower}" ]] || return 1
+
+    for title in "${!map_ref[@]}"; do
+        title_normalized="$(normalize_notification_text "${title}")"
+        title_lower="${title_normalized,,}"
+
+        if [[ "${summary_lower}" == "${title_lower}" ]]; then
+            printf '%s\n' "${title}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+select_notification_summary_for_matching() {
+    local summary="$1"
+    local body="$2"
+    local normalized_summary=""
+    local normalized_body=""
+
+    normalized_summary="$(normalize_notification_text "${summary}")"
+    normalized_body="$(normalize_notification_text "${body}")"
+
+    if [[ "${normalized_summary}" == "${WINDOW_PATTERN}" ]] && is_game_window_title "${normalized_body}"; then
+        printf '%s\n' "${normalized_body}"
+        return 0
+    fi
+
+    printf '%s\n' "${normalized_summary}"
+}
+
+remember_notification_signature() {
+    local signature="$1"
+    local now_ts="$2"
+
+    LAST_NOTIFICATION_SIGNATURE="${signature}"
+    LAST_NOTIFICATION_TS="${now_ts}"
+}
+
+handle_dbus_notification() {
+    local app_name="$1"
+    local summary="$2"
+    local body="$3"
+    local matched_title=""
+    local matching_summary=""
+    local active_window_id=""
+    local target_window_id=""
+    local normalized_target_window_id=""
+    local notification_signature=""
+    local now_ts=0
+    local -A window_id_by_title=()
+
+    debug_log "Notification recue : app='${app_name}' summary='${summary}' body='${body}'"
+    matching_summary="$(select_notification_summary_for_matching "${summary}" "${body}")"
+
+    if ! notification_matches_filter "${app_name}" "${summary}" "${body}"; then
+        debug_log "Notification ignorée : filtre source non correspondant."
+        return 0
+    fi
+
+    if ! build_open_window_title_map window_id_by_title; then
+        debug_log "Notification ignorée : aucune fenêtre ${WINDOW_PATTERN} ouverte."
+        return 0
+    fi
+
+    matched_title="$(find_matching_window_title_from_summary "${matching_summary}" window_id_by_title || true)"
+    if [[ -z "${matched_title}" ]]; then
+        debug_log "Notification ignorée : aucun titre exact reconnu depuis le summary."
+        return 0
+    fi
+
+    target_window_id="${window_id_by_title["${matched_title}"]}"
+    notification_signature="${matched_title}|${matching_summary}"
+    debug_log "Notification corrélée par summary/titre : ${matched_title}"
+
+    normalized_target_window_id="$(normalize_window_id "${target_window_id}")" || normalized_target_window_id="${target_window_id}"
+    now_ts="$(date +%s)"
+
+    if [[ "${notification_signature}" == "${LAST_NOTIFICATION_SIGNATURE}" ]] \
+        && (( now_ts - LAST_NOTIFICATION_TS < NOTIFICATION_DEDUP_SECONDS )); then
+        debug_log "Notification ignorée : doublon recent."
+        return 0
+    fi
+
+    active_window_id="$(get_active_window_id || true)"
+    if [[ -n "${active_window_id}" && "${active_window_id}" == "${normalized_target_window_id}" ]]; then
+        remember_notification_signature "${notification_signature}" "${now_ts}"
+        debug_log "Notification ignorée : fenêtre déjà active."
+        return 0
+    fi
+
+    if ! focus_window "${target_window_id}"; then
+        debug_log "Impossible de focus la fenêtre ${target_window_id}."
+        return 0
+    fi
+
+    remember_notification_signature "${notification_signature}" "${now_ts}"
+    debug_log "Fenêtre focusée via notification -> ${target_window_id}"
+}
+
+listen_notifications() {
+    require_commands dbus-monitor wmctrl xprop stdbuf
+    validate_notification_settings
+
+    debug_log "Ecoute des notifications Dofus sur DBus..."
+
+    process_dbus_notification_stream handle_dbus_notification < <(
+        stdbuf -oL -eL dbus-monitor --session --monitor \
+            "type='method_call',interface='org.freedesktop.Notifications',member='Notify'"
+    )
 }
 
 sync_audio_if_possible() {
@@ -473,6 +878,9 @@ main() {
         --edit-active)
             edit_active
             ;;
+        --listen-notifications)
+            listen_notifications
+            ;;
         -h|--help)
             usage
             ;;
@@ -483,4 +891,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

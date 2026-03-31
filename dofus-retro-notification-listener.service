@@ -1,0 +1,16 @@
+[Unit]
+Description=Dofus Retro notification listener
+Wants=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/DofusRetroWindowSwitcher
+# Environment=NOTIFICATION_APP_PATTERN=Dofus
+# Environment=DEBUG=1
+ExecStart=/usr/bin/bash %h/Projects/DofusRetroWindowSwitcher/switcher.sh --listen-notifications
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
