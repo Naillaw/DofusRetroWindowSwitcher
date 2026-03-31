@@ -7,8 +7,7 @@ Le script :
 - associe chaque fenêtre à un pseudo via son titre, par exemple `Nayl - Dofus Retro v1.47.22`
 - trie les comptes par initiative décroissante
 - active la fenêtre suivante à chaque exécution
-- conserve le son uniquement sur la fenêtre avec la plus haute initiative
-- coupe le son des autres fenêtres
+- synchronise le son lors des mises à jour de configuration pour ne le garder que sur la fenêtre avec la plus haute initiative
 
 ## Fichiers
 
@@ -71,6 +70,8 @@ Ou :
 bash /home/nayl/Projects/DofusRetroWindowSwitcher/switcher.sh
 ```
 
+Le switch simple n’ajuste plus l’audio, ce qui réduit le délai au changement de fenêtre.
+
 Scanner les fenêtres ouvertes et mettre à jour automatiquement `dofus_accounts.conf` :
 
 ```bash
@@ -83,9 +84,8 @@ Le scan :
 - met les fenêtres ouvertes dans `[ACTIVE]`
 - déplace les anciens comptes absents dans `[HISTORICAL]`
 - conserve les initiatives déjà présentes dans `dofus_accounts.conf`
-- attribue une initiative par défaut aux nouvelles entrées
-- affiche un tableau des comptes déjà configurés
-- affiche un tableau des fenêtres détectées avec l’initiative retenue
+- attribue l’initiative `100` aux nouvelles entrées
+- resynchronise le mute/unmute si les fenêtres sont ouvertes
 
 Mettre à jour directement l’initiative d’un pseudo :
 
@@ -93,11 +93,15 @@ Mettre à jour directement l’initiative d’un pseudo :
 bash /home/nayl/Projects/DofusRetroWindowSwitcher/switcher.sh --set-ini "Nayl" 120
 ```
 
+Cette commande resynchronise aussi l’audio si les fenêtres sont ouvertes.
+
 Editer les initiatives des comptes actifs depuis le terminal :
 
 ```bash
 bash /home/nayl/Projects/DofusRetroWindowSwitcher/switcher.sh --edit-active
 ```
+
+Cette commande resynchronise aussi l’audio si les fenêtres sont ouvertes.
 
 ## Raccourci KDE
 
